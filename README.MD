@@ -60,4 +60,165 @@ Netty客户端通信序列图如下：
 
 Netty的IO线程NioEventLoop由于**聚合了多路复用器Selector，可以同时并发处理成百上千个客户端Channel，由于读写操作都是非阻塞的**，这就可以充分提升IO线程的运行效率，避免由于频繁的IO阻塞导致的线程挂起。除此之外，由于**Netty采用了异步通信模式，一个IO线程可以并发处理N个客户端连接和读写操作**，这也从根本上解决了传统同步阻塞IO一连接一线程模型，架构的性能，弹性伸缩能力和可靠性都有了极大的提升。
 
+
+
 **2.2.2 零拷贝**
+
+Netty零拷贝主要体现在如下3方面：
+
+1. Netty的接收和发送ByteBuffer采用DIRECT BUFFERS, 使用堆外直接内存进行Socket读写，不需要进行字节缓冲区的二次拷贝。如果使用传统的堆内存(HEAP BUFFERS)进行Socket读写，JVM会将堆内存Buffer拷贝一份到直接内存，然后才写入到Socket中。相比于堆外直接内存，消息在发送过程中多了一次缓冲区的内存拷贝；
+2. Netty提供了组合Buffer对象，可以聚合多个ByteBuffer对象，用户可以像操作一个Buffer那样方便的对组合Buffer进行操作，避免了传统通过内存拷贝的方式将几个小Buffer合并成一个大的Buffer。
+3. Netty的文件传输采用了transferTo方法，它可以直接将文件缓存区的数据发送到目标Channel，避免了传统通过循环write方法导致的内存拷贝问题。   
+
+——————— to be continue
+
+
+
+**2.2.3 内存池**
+
+随着JVM虚拟机和JIT即时编译技术的发展，对象的分配和回收是个非常轻量级的工作。但是对于缓冲区Buffer，情况却稍有不同，特别是对于堆外直接内存的分配和回收，是一件耗时的操作。为了尽量重用缓冲区，Netty提供了基于内存池的缓冲区重用机制。下面我们一起看下Netty ByteBuf的实现：
+
+ ![CachePool](pic/CachePool.png)
+
+内存池 ByteBuf
+
+Netty提供了多种内存管理策略，通过在启动辅助类中配置相关参数，可以实现差异化的定制。
+
+可以通过以下的性能测试来看下基于内存池循环利用ByteBuf和普通ByteBuf的性能差异
+
+用例一，使用内存是分配器创建直接内存缓冲区
+
+```java
+int loop = 300000000;
+long startTime = System.currentTimeMillis();
+ByteBuf poolBuffer = null;
+for (int i=0; i<loop; i++) {
+  poolBuffer = PooledByteBufAllocator.DEFAULT.directBuffer(1024);
+  poolBuffer.writeBytes(CONTENT);
+  poolBuffer.release();
+}
+```
+
+用例二，使用费堆内存分配器创建的直接内存缓冲区
+
+```java
+long startTime2 = System.currentTimeMillis();
+ByteBuf buffer = null;
+for(int i = 0; i < loop; i++) {
+  buffer = Unpooled.directBuffer(1024);
+  buffer.writeBytes(CONTENT);
+}
+```
+
+
+
+
+
+**2.2.4 高效地Reactor线程模型**
+
+常用的Reactor线程模型有3种：
+
+1. Reactor单线程模式；
+2. Reactor多线程模式；
+3. 主从Reactor多线程模式；
+
+Reactor单线程模式，指的是所有的IO操作都在同一个NIO线程上面完成，NIO线程的之策如下：
+
+* 作为NIO服务端，接受客户端的TCP连接；
+* 作为NIO服务端，向服务端发起TCP连接；
+* 读取通信对端的请求或者应答消息；
+* 想通信对端发起消息请求或应答消息；
+
+Reactor线程模型示意图如下
+
+ ![ReactorSingleThread](pic/ReactorSingleThread.png)
+
+由于Reactor模式使用的是异步非阻塞IO，所有的IO操作都不会导致阻塞，理论上一个线程可以独立处理所有IO相关的操作。从架构层面上看，一个NIO线程的确可以完成其承担的责任。例如，通过Acceptor接收客户端的TCP连接请求消息，链路建立成功之后，通过Dispatch将对应的ByteBuffer派发到指定的Handler上进行消息解码。用户Handler可以通过NIO线程将消息发送给客户端。
+
+对于一些小容量的应用场景可以使用单线程模型。但对于高负载，大并发的应用却并不合适，原因如下：
+
+* 一个NIO线程同时处理一个NIO线程同时处理成百上千的链路，性能上无法支撑，即便NIO线程的CPU负荷达到100%，也无法满足海量消息的编码、解码、读取和发送；
+* 当NIO线程负载过重之后，处理速度将变慢，这会导致大量客户端连接超时，超时之后往往会进行重发，这更加重了NIO线程的负载，最终会导致大量消息积压和处理超时，NIO线程会成为系统的性能瓶颈；
+* 可靠性问题：一旦NIO线程意外跑飞，或者进入死循环，会导致整个系统通信模块不可用，不能接收和处理外部消息，造成节点故障。
+
+为了解决这些问题，演进出了Reactor多线程模式。
+
+Reactor多线程模式与但线程模式最大的区别就是有一组NIO线程处理IO操作，原理图如下：
+
+ ![ReactorMutilpleThread](pic/ReactorMutilpleThread.png)
+
+Reactor多线程模式的特点：
+
+* 有专门的一个NIO线程-Acceptor线程用于监听服务端，接受客户端的TCP连接请求；
+* 网络IO操作-读、写等由一个NIO线程池负责，线程池可以采用标准的JDK线程池实现，它包含一个任务队列和N个可用的线程，由这些NIO线程负责消息的读取、解码、编码和发送；
+* 1个NIO线程可以同时处理N条链路，但是1个链路只对应1个NIO线程，防止发生并发操作问题。
+
+在绝大多数场景下，Reactor多线程模型都可以满足性能需求；但是，在极特殊应用场景中，一个NIO线程负责监听和处理所有的客户端连接可能会存在性能问题。例如百万客户端并发连接，或者服务端需要对客户端的握手消息进行安全认证，认证本身非常损耗性能。在这类场景下，单独一个Acceptor线程可能会存在性能不足问题，为了解决性能问题，产生了第三种Reactor线程模型-主从Reactor多线程模型。
+
+主从Reactor线程模型的特点是：服务端用于接收客户端连接的不再是个1个单独的NIO线程，而是一个独立的NIO线程池。Acceptor接收到客户端TCP连接请求处理完成后（可能包含接入认证等），将新创建的SocketChannel注册到IO线程池（sub reactor线程池）的某个IO线程上，由它负责SocketChannel的读写和编解码工作。Acceptor线程池仅仅只用于客户端的登陆、握手和安全认证，一旦链路建立成功，就将链路注册到后端subReactor线程池的IO线程上，由IO线程负责后续的IO操作。
+
+主从Reactor线程模型如下图所示：
+
+ ![MasterSlaveMultipleReactor](pic/MasterSlaveMultipleReactor.png)
+
+利用主从NIO线程模型，可以解决一个服务端监听线程无法有效处理所有客户端连接的性能不足问题。
+
+事实上，Netty的线程模型并非固定不变，通过在启动辅助类中创建不同的EventLoopGroup实例并通过适当的参数配置，就可以支持上述三种Reactor线程模型。正是因为Netty 对Reactor线程模型的支持提供了灵活的定制能力，所以可以满足不同业务场景的性能诉求。
+
+
+
+**2.2.5 无锁化得串行设计理念**
+
+在大多数场景下，并行多线程处理可以提升系统的并发性能。但是，如果对于共享资源的并发访问处理不当，会带来严重的锁竞争，这最终会导致性能的下降。为了尽可能的避免锁竞争带来的性能损耗，可以通过串行化设计，即消息的处理尽可能在同一个线程内完成，期间不进行线程切换，这样就避免了多线程竞争和同步锁。
+
+为了尽可能提升性能，Netty采用了串行无锁化设计，在IO线程内部进行串行操作，避免多线程竞争导致的性能下降。表面上看，串行化设计似乎CPU利用率不高，并发程度不够。但是，通过调整NIO线程池的线程参数，可以同时启动多个串行化的线程并行运行，这种局部无锁化的串行线程设计相比一个队列-多个工作线程模型性能更优。
+
+Netty的串行化设计工作原理图如下：
+
+ ![unlockSIngleThread](pic/unlockSIngleThread.png)
+
+Netty的NioEventLoop读取到消息之后，直接调用ChannelPipeline的fireChannelRead(Object msg)，只要用户不主动切换线程，一直会由NioEventLoop调用到用户的Handler，期间不进行线程切换，这种串行化处理方式避免了多线程操作导致的锁的竞争，从性能角度看是最优的。
+
+
+
+**2.2.6 高效地并发编程**
+
+Netty的高效并发编程主要体现在如下几点：
+
+1) volatile的大量、正确使用;
+
+2) CAS和原子类的广泛使用；
+
+3) 线程安全容器的使用；
+
+4) 通过读写锁提升并发性能。
+
+
+
+**2.2.7 高性能的序列化框架**
+
+影响序列化性能的关键因素总结如下：
+
+1) 序列化后的码流大小（网络带宽的占用）；
+
+2) 序列化&反序列化的性能（CPU资源占用）；
+
+3) 是否支持跨语言（异构系统的对接和开发语言切换）。
+
+Netty默认提供了对Google Protobuf的支持，通过扩展Netty的编解码接口，用户可以实现其它的高性能序列化框架，例如Thrift的压缩二进制编解码框架。
+
+
+
+**2.2.8 灵活的TCP参数配置能力**
+
+合理设置TCP参数在某些场景下对于性能的提升可以起到显著的效果，例如SO_RCVBUF和SO_SNDBUF。如果设置不当，对性能的影响是非常大的。下面我们总结下对性能影响比较大的几个配置项：
+
+1) SO_RCVBUF和SO_SNDBUF：通常建议值为128K或者256K；
+
+2) SO_TCPNODELAY：NAGLE算法通过将缓冲区内的小封包自动相连，组成较大的封包，阻止大量小封包的发送阻塞网络，从而提高网络应用效率。但是对于时延敏感的应用场景需要关闭该优化算法；
+
+3) 软中断：如果Linux内核版本支持RPS（2.6.35以上版本），开启RPS后可以实现软中断，提升网络吞吐量。RPS根据数据包的源地址，目的地址以及目的和源端口，计算出一个hash值，然后根据这个hash值来选择软中断运行的cpu，从上层来看，也就是说将每个连接和cpu绑定，并通过这个hash值，来均衡软中断在多个cpu上，提升网络并行处理性能。
+
+Netty在启动辅助类中可以灵活的配置TCP参数，满足不同的用户场景。相关配置接口定义如下：
+
+ ![TCPConfiguration](pic/TCPConfiguration.png)
