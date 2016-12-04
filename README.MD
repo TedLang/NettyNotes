@@ -16,7 +16,7 @@ Netty是一个**_高性能，异步事件驱动的NIO框架_**，它提供了对
 
 1. 网络传输方面的问题：传统的RPC框架或基于RMI等方式的远程传输调用采用了**同步阻塞IO**,当客户端的并发压力或者网络时延增大后，同步阻塞IO会由于过于频繁的wait导致IO线程经常性的阻塞，由于线程无法高效地工作，IO处理能力自然下降。
 
-    ![BIO_Diagram](Pic/BIO_Diagram.png)
+    ![BIO_Diagram](pic/BIO_Diagram.png)
 
    BIO 通信模型图
 
@@ -46,17 +46,17 @@ Netty是一个**_高性能，异步事件驱动的NIO框架_**，它提供了对
 
 JDK NIO通信模式如下：
 
- ![JDK_NIO](Pic/JDK_NIO.png)
+ ![JDK_NIO](pic/JDK_NIO.png)
 
 与Socket类和SocketServer类相对应，NIO也提供了SocketChannel与ServerSocketChannel两种不同的套接字通道实现。这两种新增的通道都支持阻塞和非阻塞两种模式。阻塞模式使用非常简单，但是性能和可靠性都不好，非阻塞模式正好相反。开发人员一般可以根据自己的需要来选择合适的模式，一般来说，低负载、低并发的应用程序可以选择同步阻塞IO以降低编程复杂度。但是对于高负载、高并发的网络应用，需要使用NIO的非阻塞模式进行开发。
 
 Netty架构按照Reactor模式设计和实现，服务端的通信序列图如下：
 
- ![Netty_Server](Pic/Netty_Server.png)
+ ![Netty_Server](pic/Netty_Server.png)
 
 Netty客户端通信序列图如下：
 
- ![Netty_Client](Pic/Netty_Client.png)
+ ![Netty_Client](pic/Netty_Client.png)
 
 Netty的IO线程NioEventLoop由于**聚合了多路复用器Selector，可以同时并发处理成百上千个客户端Channel，由于读写操作都是非阻塞的**，这就可以充分提升IO线程的运行效率，避免由于频繁的IO阻塞导致的线程挂起。除此之外，由于**Netty采用了异步通信模式，一个IO线程可以并发处理N个客户端连接和读写操作**，这也从根本上解决了传统同步阻塞IO一连接一线程模型，架构的性能，弹性伸缩能力和可靠性都有了极大的提升。
 
